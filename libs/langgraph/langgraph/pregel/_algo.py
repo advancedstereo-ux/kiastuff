@@ -31,7 +31,7 @@ from langgraph.checkpoint.base import (
 from langgraph.store.base import BaseStore
 from xxhash import xxh3_128_hexdigest
 
-from langgraph._internal._config import merge_configs, patch_config
+from langgraph._internal._config import merge_configs, patch_config, patch_configurable
 from langgraph._internal._constants import (
     CACHE_NS_WRITES,
     CONF,
@@ -69,6 +69,10 @@ from langgraph.managed.base import ManagedValueMapping
 from langgraph.pregel._call import get_runnable_for_task, identifier
 from langgraph.pregel._io import read_channels
 from langgraph.pregel._log import logger
+from langgraph.pregel._task_policy_fixed import (
+    assert_pull_route_guards,
+    assert_task_routing_allowed,
+)
 from langgraph.pregel._read import INPUT_CACHE_KEY_TYPE, PregelNode
 from langgraph.runtime import DEFAULT_RUNTIME, Runtime
 from langgraph.types import (
@@ -609,6 +613,21 @@ def prepare_single_task(
                 step,
                 stop,
             )
+            assert_pull_route_guards(
+                patch_configurable(
+                    config,
+                    {
+                        CONFIG_KEY_READ: partial(
+                            local_read,
+                            scratchpad,
+                            channels,
+                            managed,
+                            PregelTaskWrites(task_path[:3], name, (), triggers),
+                        ),
+                    },
+                ),
+                name,
+            )
             # create task input
             try:
                 val = _proc_input(
@@ -900,12 +919,6 @@ def prepare_push_task_send(
         if packet.node not in processes:
             logger.warning(f"Ignoring unknown node name {packet.node} in pending sends")
             return
-        # find process
-        proc = processes[packet.node]
-        proc_node = proc.node
-        if proc_node is None:
-            return
-        # create task id
         triggers = PUSH_TRIGGER
         checkpoint_ns = (
             f"{parent_ns}{NS_SEP}{packet.node}" if parent_ns else packet.node
@@ -918,14 +931,48 @@ def prepare_push_task_send(
             PUSH,
             str(idx),
         )
+        task_checkpoint_ns = f"{checkpoint_ns}:{task_id}"
+        translated_task_path = (*task_path[:3], False)
+        scratchpad = _scratchpad(
+            config[CONF].get(CONFIG_KEY_SCRATCHPAD),
+            pending_writes,
+            task_id,
+            xxh3_128_hexdigest(task_checkpoint_ns.encode()),
+            config[CONF].get(CONFIG_KEY_RESUME_MAP),
+            step,
+            stop,
+        )
+        assert_task_routing_allowed(
+            patch_configurable(
+                config,
+                {
+                    CONFIG_KEY_READ: partial(
+                        local_read,
+                        scratchpad,
+                        channels,
+                        managed,
+                        PregelTaskWrites(
+                            translated_task_path,
+                            packet.node,
+                            (),
+                            triggers,
+                        ),
+                    ),
+                },
+            ),
+            packet.node,
+        )
+        # find process
+        proc = processes[packet.node]
+        proc_node = proc.node
+        if proc_node is None:
+            return
     else:
         logger.warning(f"Ignoring invalid PUSH task path {task_path}")
         return
+
     configurable = config.get(CONF, {})
     task_checkpoint_ns = f"{checkpoint_ns}:{task_id}"
-    # we append False to the task path to indicate that a call is not being made
-    # so we should return interrupts from this task
-    translated_task_path = (*task_path[:3], False)
     metadata = {
         "langgraph_step": step,
         "langgraph_node": packet.node,
@@ -955,15 +1002,6 @@ def prepare_push_task_send(
             )
         else:
             cache_key = None
-        scratchpad = _scratchpad(
-            config[CONF].get(CONFIG_KEY_SCRATCHPAD),
-            pending_writes,
-            task_id,
-            xxh3_128_hexdigest(task_checkpoint_ns.encode()),
-            config[CONF].get(CONFIG_KEY_RESUME_MAP),
-            step,
-            stop,
-        )
         runtime = cast(Runtime, configurable.get(CONFIG_KEY_RUNTIME, DEFAULT_RUNTIME))
         runtime = runtime.override(
             store=store, previous=checkpoint["channel_values"].get(PREVIOUS, None)

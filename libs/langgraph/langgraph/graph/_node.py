@@ -90,3 +90,8 @@ class StateNodeSpec(Generic[NodeInputT, ContextT]):
     cache_policy: CachePolicy | None
     ends: tuple[str, ...] | dict[str, str] | None = EMPTY_SEQ
     defer: bool = False
+    #: Optional task namespace for static isolation checks (see :meth:`StateGraph.validate`).
+    task_ns: str | None = None
+    #: Whether this node is a "shared resource" that should be expanded into
+    #: per-``task_ns`` proxy nodes for control-plane isolation.
+    shared: bool = False

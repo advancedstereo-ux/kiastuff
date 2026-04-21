@@ -12,6 +12,7 @@ from contextlib import (
     ExitStack,
 )
 from datetime import datetime, timezone
+from functools import partial
 from inspect import signature
 from types import TracebackType
 from typing import (
@@ -35,6 +36,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.store.base import BaseStore
 from typing_extensions import ParamSpec, Self
+from xxhash import xxh3_128_hexdigest
 
 from langgraph._internal._config import patch_configurable
 from langgraph._internal._constants import (
@@ -42,12 +44,18 @@ from langgraph._internal._constants import (
     CONFIG_KEY_CHECKPOINT_ID,
     CONFIG_KEY_CHECKPOINT_MAP,
     CONFIG_KEY_CHECKPOINT_NS,
+    CONFIG_KEY_READ,
     CONFIG_KEY_REPLAY_STATE,
     CONFIG_KEY_RESUME_MAP,
     CONFIG_KEY_RESUMING,
+    CONFIG_KEY_ROUTE_GUARDS,
     CONFIG_KEY_SCRATCHPAD,
     CONFIG_KEY_STREAM,
     CONFIG_KEY_TASK_ID,
+    CONFIG_KEY_TASK_NS,
+    CONFIG_KEY_ENFORCE_THREAD_ID_FORMAT,
+    CONFIG_KEY_ENFORCE_THREAD_ID_SCOPE,
+    CONFIG_KEY_ENFORCE_THREAD_TASK_NS,
     CONFIG_KEY_THREAD_ID,
     ERROR,
     INPUT,
@@ -58,6 +66,8 @@ from langgraph._internal._constants import (
     PUSH,
     RESUME,
     TASKS,
+    THREAD_ID_SCOPE_BINDING,
+    THREAD_TASK_NS_BINDING,
 )
 from langgraph._internal._replay import ReplayState
 from langgraph._internal._scratchpad import PregelScratchpad
@@ -67,6 +77,7 @@ from langgraph.channels.untracked_value import UntrackedValue
 from langgraph.constants import TAG_HIDDEN
 from langgraph.errors import (
     EmptyInputError,
+    InvalidUpdateError,
     GraphInterrupt,
 )
 from langgraph.managed.base import (
@@ -77,9 +88,11 @@ from langgraph.pregel._algo import (
     Call,
     GetNextVersion,
     PregelTaskWrites,
+    _scratchpad,
     apply_writes,
     checkpoint_null_version,
     increment,
+    local_read,
     prepare_next_tasks,
     prepare_single_task,
     sanitize_untracked_values_in_send,
@@ -104,6 +117,7 @@ from langgraph.pregel._io import (
     map_output_values,
     read_channels,
 )
+from langgraph.pregel._task_policy import parse_thread_id_scope, thread_id_scope_key
 from langgraph.pregel._read import PregelNode
 from langgraph.pregel._utils import get_new_channel_versions, is_xxh3_128_hexdigest
 from langgraph.pregel.debug import (
@@ -296,6 +310,9 @@ class PregelLoop:
                     self.checkpoint_config,
                     {CONFIG_KEY_THREAD_ID: str(thread_id)},
                 )
+                thread_id = self.checkpoint_config[CONF][CONFIG_KEY_THREAD_ID]
+            if self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_ID_FORMAT):
+                parse_thread_id_scope(cast(str, thread_id))
         self.checkpoint_ns = (
             tuple(cast(str, self.config[CONF][CONFIG_KEY_CHECKPOINT_NS]).split(NS_SEP))
             if self.config[CONF].get(CONFIG_KEY_CHECKPOINT_NS)
@@ -691,8 +708,33 @@ class PregelLoop:
                         )
 
             writes: defaultdict[str, list[tuple[str, Any]]] = defaultdict(list)
+            cmd_config = self.config
+            if self.config.get(CONF, {}).get(CONFIG_KEY_ROUTE_GUARDS):
+                cmd_scratchpad = _scratchpad(
+                    self.config[CONF].get(CONFIG_KEY_SCRATCHPAD),
+                    list(self.checkpoint_pending_writes),
+                    NULL_TASK_ID,
+                    xxh3_128_hexdigest(b"__pregel_command__"),
+                    self.config[CONF].get(CONFIG_KEY_RESUME_MAP),
+                    self.step,
+                    self.stop,
+                )
+                cmd_config = patch_configurable(
+                    self.config,
+                    {
+                        CONFIG_KEY_READ: partial(
+                            local_read,
+                            cmd_scratchpad,
+                            self.channels,
+                            self.managed,
+                            PregelTaskWrites((), "__command__", (), ()),
+                        ),
+                    },
+                )
             # group writes by task ID
-            for tid, c, v in map_command(cmd=cast(Command, self.input)):
+            for tid, c, v in map_command(
+                cast(Command, self.input), config=cmd_config
+            ):
                 if not (c == RESUME and resume_is_map):
                     writes[tid].append((c, v))
             if not writes and not resume_is_map:
@@ -797,6 +839,21 @@ class PregelLoop:
             metadata["step"] = self.step
             metadata["parents"] = self.config[CONF].get(CONFIG_KEY_CHECKPOINT_MAP, {})
             self.checkpoint_metadata = metadata
+
+        # Optionally bind a thread_id to a single task_ns for safety.
+        if (
+            self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_TASK_NS)
+            and (task_ns := self.config.get(CONF, {}).get(CONFIG_KEY_TASK_NS))
+            is not None
+        ):
+            metadata.setdefault(THREAD_TASK_NS_BINDING, task_ns)
+        if self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_ID_SCOPE):
+            thread_id = self.config.get(CONF, {}).get(CONFIG_KEY_THREAD_ID)
+            if thread_id is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_id_scope is enabled, config.configurable.thread_id must be provided."
+                )
+            metadata.setdefault(THREAD_ID_SCOPE_BINDING, thread_id_scope_key(str(thread_id)))
         # do checkpoint?
         do_checkpoint = self._checkpointer_put_after_previous is not None and (
             exiting or self.durability != "exit"
@@ -1180,6 +1237,38 @@ class SyncPregelLoop(PregelLoop, AbstractContextManager):
         self.checkpoint_id_saved = saved.checkpoint["id"]
         self.checkpoint = saved.checkpoint
         self.checkpoint_metadata = saved.metadata
+
+        # Enforce: a persisted thread_id is only ever used with a single task_ns.
+        if self.checkpointer and self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_TASK_NS):
+            desired_task_ns = self.config.get(CONF, {}).get(CONFIG_KEY_TASK_NS)
+            if desired_task_ns is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_task_ns is enabled, config.configurable.task_ns must be provided."
+                )
+            bound_task_ns = self.checkpoint_metadata.get(THREAD_TASK_NS_BINDING)
+            if bound_task_ns is not None and bound_task_ns != desired_task_ns:
+                raise InvalidUpdateError(
+                    f"thread_id is bound to task_ns={bound_task_ns!r}, but got task_ns={desired_task_ns!r}."
+                )
+        if self.checkpointer and self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_ID_FORMAT):
+            desired_thread_id = self.config.get(CONF, {}).get(CONFIG_KEY_THREAD_ID)
+            if desired_thread_id is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_id_format is enabled, config.configurable.thread_id must be provided."
+                )
+            parse_thread_id_scope(str(desired_thread_id))
+        if self.checkpointer and self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_ID_SCOPE):
+            desired_thread_id = self.config.get(CONF, {}).get(CONFIG_KEY_THREAD_ID)
+            if desired_thread_id is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_id_scope is enabled, config.configurable.thread_id must be provided."
+                )
+            desired_scope = thread_id_scope_key(str(desired_thread_id))
+            bound_scope = self.checkpoint_metadata.get(THREAD_ID_SCOPE_BINDING)
+            if bound_scope is not None and bound_scope != desired_scope:
+                raise InvalidUpdateError(
+                    f"thread_id scope is bound to {bound_scope!r}, but got {desired_scope!r}."
+                )
         self.checkpoint_pending_writes = (
             [(str(tid), k, v) for tid, k, v in saved.pending_writes]
             if saved.pending_writes is not None
@@ -1379,6 +1468,38 @@ class AsyncPregelLoop(PregelLoop, AbstractAsyncContextManager):
         self.checkpoint_id_saved = saved.checkpoint["id"]
         self.checkpoint = saved.checkpoint
         self.checkpoint_metadata = saved.metadata
+
+        # Enforce: a persisted thread_id is only ever used with a single task_ns.
+        if self.checkpointer and self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_TASK_NS):
+            desired_task_ns = self.config.get(CONF, {}).get(CONFIG_KEY_TASK_NS)
+            if desired_task_ns is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_task_ns is enabled, config.configurable.task_ns must be provided."
+                )
+            bound_task_ns = self.checkpoint_metadata.get(THREAD_TASK_NS_BINDING)
+            if bound_task_ns is not None and bound_task_ns != desired_task_ns:
+                raise InvalidUpdateError(
+                    f"thread_id is bound to task_ns={bound_task_ns!r}, but got task_ns={desired_task_ns!r}."
+                )
+        if self.checkpointer and self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_ID_FORMAT):
+            desired_thread_id = self.config.get(CONF, {}).get(CONFIG_KEY_THREAD_ID)
+            if desired_thread_id is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_id_format is enabled, config.configurable.thread_id must be provided."
+                )
+            parse_thread_id_scope(str(desired_thread_id))
+        if self.checkpointer and self.config.get(CONF, {}).get(CONFIG_KEY_ENFORCE_THREAD_ID_SCOPE):
+            desired_thread_id = self.config.get(CONF, {}).get(CONFIG_KEY_THREAD_ID)
+            if desired_thread_id is None:
+                raise InvalidUpdateError(
+                    "When enforce_thread_id_scope is enabled, config.configurable.thread_id must be provided."
+                )
+            desired_scope = thread_id_scope_key(str(desired_thread_id))
+            bound_scope = self.checkpoint_metadata.get(THREAD_ID_SCOPE_BINDING)
+            if bound_scope is not None and bound_scope != desired_scope:
+                raise InvalidUpdateError(
+                    f"thread_id scope is bound to {bound_scope!r}, but got {desired_scope!r}."
+                )
         self.checkpoint_pending_writes = (
             [(str(tid), k, v) for tid, k, v in saved.pending_writes]
             if saved.pending_writes is not None

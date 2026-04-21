@@ -42,6 +42,7 @@ from langgraph.errors import GraphBubbleUp, GraphInterrupt
 from langgraph.pregel._algo import Call
 from langgraph.pregel._executor import Submit
 from langgraph.pregel._retry import arun_with_retry, run_with_retry
+from langgraph.pregel._task_policy import extend_writes_with_route_stamps
 from langgraph.types import (
     CachePolicy,
     PregelExecutableTask,
@@ -452,6 +453,11 @@ class PregelRunner:
                 task.config is None or TAG_HIDDEN not in task.config.get("tags", [])
             ):
                 self.node_finished(task.name)
+            extend_writes_with_route_stamps(
+                task_name=task.name,
+                writes=task.writes,
+                config=task.config,
+            )
             if not task.writes:
                 # add no writes marker
                 task.writes.append((NO_WRITES, None))

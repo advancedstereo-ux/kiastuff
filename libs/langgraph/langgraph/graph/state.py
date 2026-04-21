@@ -5,7 +5,7 @@ import logging
 import typing
 import warnings
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Hashable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Iterator, Sequence
 from dataclasses import is_dataclass
 from functools import partial
 from inspect import isclass, isfunction, ismethod, signature
@@ -32,7 +32,11 @@ from pydantic import BaseModel, TypeAdapter
 from typing_extensions import NotRequired, Required, Self, Unpack, is_typeddict
 
 from langgraph._internal import _serde
+from langgraph._internal._config import ensure_config, patch_configurable
 from langgraph._internal._constants import (
+    CONF,
+    CONFIG_KEY_TASK_NODE_ALLOWLIST,
+    CONFIG_KEY_TASK_NS,
     INTERRUPT,
     NS_END,
     NS_SEP,
@@ -79,8 +83,10 @@ from langgraph.types import (
     CachePolicy,
     Checkpointer,
     Command,
+    Durability,
     RetryPolicy,
     Send,
+    StreamMode,
     ensure_valid_checkpointer,
 )
 from langgraph.typing import ContextT, InputT, NodeInputT, OutputT, StateT
@@ -241,6 +247,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
         self.managed = {}
         self.compiled = False
         self.waiting_edges = set()
+        #: Orchestrator edges explicitly allowed to connect different :attr:`StateNodeSpec.task_ns`.
+        self._cross_task_edges: set[tuple[str, str]] = set()
 
         self.state_schema = state_schema
         self.input_schema = cast(type[InputT], input_schema or state_schema)
@@ -580,6 +588,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
         retry_policy: RetryPolicy | Sequence[RetryPolicy] | None = None,
         cache_policy: CachePolicy | None = None,
         destinations: dict[str, str] | tuple[str, ...] | None = None,
+        task_ns: str | None = None,
+        shared: bool = False,
         **kwargs: Unpack[DeprecatedKwargs],
     ) -> Self:
         """Add a new node to the `StateGraph`.
@@ -609,6 +619,13 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
                 !!! warning
 
                     This is only used for graph rendering and doesn't have any effect on the graph execution.
+
+            task_ns: Optional task namespace label for static isolation checks in
+                :meth:`validate`. Edges between nodes with different ``task_ns`` values
+                must use :meth:`add_edge` with ``allow_cross_task=True`` (orchestrator bridges).
+            shared: If ``True``, this node is treated as a shared resource that can be
+                expanded into per-``task_ns`` proxy nodes via
+                :meth:`compile` with ``expand_shared_nodes=True``.
 
         Example:
             ```python
@@ -757,6 +774,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
                 cache_policy=cache_policy,
                 ends=ends,
                 defer=defer,
+                task_ns=task_ns,
+                shared=shared,
             )
         elif inferred_input_schema is not None:
             self.nodes[node] = StateNodeSpec(
@@ -767,6 +786,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
                 cache_policy=cache_policy,
                 ends=ends,
                 defer=defer,
+                task_ns=task_ns,
+                shared=shared,
             )
         else:
             self.nodes[node] = StateNodeSpec[StateT, ContextT](
@@ -777,6 +798,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
                 cache_policy=cache_policy,
                 ends=ends,
                 defer=defer,
+                task_ns=task_ns,
+                shared=shared,
             )
 
         input_schema = input_schema or inferred_input_schema
@@ -785,7 +808,13 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
 
         return self
 
-    def add_edge(self, start_key: str | list[str], end_key: str) -> Self:
+    def add_edge(
+        self,
+        start_key: str | list[str],
+        end_key: str,
+        *,
+        allow_cross_task: bool = False,
+    ) -> Self:
         """Add a directed edge from the start node (or list of start nodes) to the end node.
 
         When a single start node is provided, the graph will wait for that node to complete
@@ -795,6 +824,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
         Args:
             start_key: The key(s) of the start node(s) of the edge.
             end_key: The key of the end node of the edge.
+            allow_cross_task: If ``True``, allow this edge to connect nodes with different
+                :attr:`~langgraph.graph._node.StateNodeSpec.task_ns` values (orchestrator bridge).
 
         Raises:
             ValueError: If the start key is `'END'` or if the start key or end key is not present in the graph.
@@ -824,6 +855,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
                 )
 
             self.edges.add((start_key, end_key))
+            if allow_cross_task:
+                self._cross_task_edges.add((start_key, end_key))
             return self
 
         for start in start_key:
@@ -837,6 +870,9 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             raise ValueError(f"Need to add_node `{end_key}` first")
 
         self.waiting_edges.add((tuple(start_key), end_key))
+        if allow_cross_task:
+            for start in start_key:
+                self._cross_task_edges.add((start, end_key))
         return self
 
     def add_conditional_edges(
@@ -1032,8 +1068,60 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
                 if node not in self.nodes:
                     raise ValueError(f"Interrupt node `{node}` not found")
 
+        self._validate_task_ns()
+
         self.compiled = True
         return self
+
+    def _task_ns_of_node(self, node: str) -> str | None:
+        if node in (START, END):
+            return None
+        spec = self.nodes.get(node)
+        return spec.task_ns if spec is not None else None
+
+    def _validate_task_ns(self) -> None:
+        if not any(spec.task_ns is not None for spec in self.nodes.values()):
+            return
+
+        def check(src: str, dst: str) -> None:
+            if dst == END:
+                return
+            ts, td = self._task_ns_of_node(src), self._task_ns_of_node(dst)
+            if ts is None or td is None:
+                return
+            if ts == td:
+                return
+            if (src, dst) in self._cross_task_edges:
+                return
+            raise ValueError(
+                f"Cross-task edge from {src!r} (task_ns={ts!r}) to {dst!r} (task_ns={td!r}) "
+                "is not allowed. Use add_edge(..., allow_cross_task=True) for orchestrator bridges."
+            )
+
+        for src, dst in self._all_edges:
+            check(src, dst)
+
+        for start, branches in self.branches.items():
+            for branch in branches.values():
+                if branch.ends is None:
+                    continue
+                for end in branch.ends.values():
+                    check(start, end)
+
+        for name, spec in self.nodes.items():
+            if not spec.ends:
+                continue
+            ends_iter = (
+                spec.ends.values() if isinstance(spec.ends, dict) else spec.ends
+            )
+            for end in ends_iter:
+                check(name, end)
+
+    def nodes_for_task_ns(self, task_ns: str) -> frozenset[str]:
+        """Return node names that declare the given ``task_ns`` (for runtime allowlists)."""
+        return frozenset(
+            n for n, spec in self.nodes.items() if spec.task_ns == task_ns
+        )
 
     def compile(
         self,
@@ -1045,6 +1133,8 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
         interrupt_after: All | list[str] | None = None,
         debug: bool = False,
         name: str | None = None,
+        auto_task_allowlist: bool = False,
+        expand_shared_nodes: bool = False,
     ) -> CompiledStateGraph[StateT, ContextT, InputT, OutputT]:
         """Compiles the `StateGraph` into a `CompiledStateGraph` object.
 
@@ -1077,6 +1167,20 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             interrupt_after: An optional list of node names to interrupt after.
             debug: A flag indicating whether to enable debug mode.
             name: The name to use for the compiled graph.
+            auto_task_allowlist: If ``True``, each ``invoke``/``stream``/``ainvoke``/``astream``
+                will set ``configurable["task_node_allowlist"]`` automatically when
+                ``configurable["task_ns"]`` is set and ``task_node_allowlist`` is not
+                already provided. The allowlist is
+                :meth:`nodes_for_task_ns` ``(task_ns)`` — i.e. all nodes whose compile-time
+                ``task_ns`` matches. Tag orchestrator and peer nodes with the same
+                ``task_ns`` when they should share this view.
+
+            expand_shared_nodes: If ``True``, nodes added with ``shared=True`` will be
+                expanded into per-``task_ns`` proxy nodes
+                (``<shared_node>__proxy__<task_ns>``). All control-flow edges and
+                branch targets that reference shared nodes will be rewritten to the
+                corresponding proxy nodes, and the original shared nodes will be
+                removed from the compiled graph (control-plane isolation).
 
         Returns:
             CompiledStateGraph: The compiled `StateGraph`.
@@ -1104,6 +1208,208 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             checkpointer = _serde.apply_checkpointer_allowlist(
                 checkpointer, serde_allowlist
             )
+
+        if expand_shared_nodes:
+            shared_nodes = {name for name, spec in self.nodes.items() if spec.shared}
+            task_names = sorted(
+                {
+                    spec.task_ns
+                    for spec in self.nodes.values()
+                    if spec.task_ns is not None
+                }
+            )
+            if shared_nodes and not task_names:
+                raise ValueError(
+                    "expand_shared_nodes=True requires at least one node with a "
+                    "non-None task_ns in the graph."
+                )
+            if shared_nodes:
+                proxy_sep = "__proxy__"
+                proxy_name = lambda base, ns: f"{base}{proxy_sep}{ns}"
+
+                orig_nodes = dict(self.nodes)
+                orig_edges = set(self.edges)
+                orig_waiting_edges = set(self.waiting_edges)
+                orig_branches = self.branches
+
+                def _rewrite_end_if_shared(end: str, *, src_task_ns: str) -> str:
+                    if end in shared_nodes:
+                        return proxy_name(end, src_task_ns)
+                    return end
+
+                # 1) Remove original shared nodes from the node set
+                new_nodes: dict[str, StateNodeSpec[Any, ContextT]] = {
+                    name: spec for name, spec in self.nodes.items() if name not in shared_nodes
+                }
+
+                # 2) Add per-task proxy nodes for each shared node
+                for shared in shared_nodes:
+                    spec = orig_nodes[shared]
+                    for ns in task_names:
+                        new_name = proxy_name(shared, ns)
+                        if new_name in new_nodes:
+                            raise ValueError(
+                                f"Shared-node proxy name collision: {new_name!r}"
+                            )
+                        new_nodes[new_name] = StateNodeSpec(
+                            runnable=spec.runnable,
+                            metadata=spec.metadata,
+                            input_schema=spec.input_schema,
+                            retry_policy=spec.retry_policy,
+                            cache_policy=spec.cache_policy,
+                            ends=spec.ends,
+                            defer=spec.defer,
+                            task_ns=ns,
+                            shared=False,
+                        )
+
+                # 3) Rewrite static edges (incoming/outgoing from shared nodes)
+                new_edges: set[tuple[str, str]] = set()
+                for src, dst in orig_edges:
+                    if src in shared_nodes:
+                        for ns in task_names:
+                            new_src = proxy_name(src, ns)
+                            new_dst = (
+                                proxy_name(dst, ns)
+                                if dst in shared_nodes
+                                else dst
+                            )
+                            new_edges.add((new_src, new_dst))
+                    elif dst in shared_nodes:
+                        src_task_ns = orig_nodes[src].task_ns
+                        if src_task_ns is None:
+                            raise ValueError(
+                                f"Cannot route to shared node {dst!r} from {src!r}: "
+                                "source node has task_ns=None."
+                            )
+                        new_edges.add((src, proxy_name(dst, src_task_ns)))
+                    else:
+                        new_edges.add((src, dst))
+
+                # 4) Rewrite waiting edges (only support shared nodes as the end target)
+                new_waiting_edges: set[tuple[tuple[str, ...], str]] = set()
+                for starts, end in orig_waiting_edges:
+                    if end in shared_nodes:
+                        if any(s in shared_nodes for s in starts):
+                            raise ValueError(
+                                "expand_shared_nodes currently supports shared nodes "
+                                "as waiting-edge end targets only (not as start nodes)."
+                            )
+                        task_ns_values = {
+                            orig_nodes[s].task_ns for s in starts if s not in (START, END)
+                        }
+                        if len(task_ns_values) != 1 or (None in task_ns_values):
+                            raise ValueError(
+                                "expand_shared_nodes requires waiting-edge starts to all "
+                                "share the same non-None task_ns."
+                            )
+                        ns = next(iter(task_ns_values))  # type: ignore[assignment]
+                        new_waiting_edges.add((starts, proxy_name(end, ns)))
+                    else:
+                        if any(s in shared_nodes for s in starts):
+                            raise ValueError(
+                                "expand_shared_nodes currently supports shared nodes "
+                                "as waiting-edge end targets only (not as start nodes)."
+                            )
+                        new_waiting_edges.add((starts, end))
+
+                # 5) Rewrite branches (only support shared nodes as the branch source)
+                new_branches: defaultdict[str, dict[str, BranchSpec]] = defaultdict(dict)
+                for source, branches in orig_branches.items():
+                    if source in shared_nodes:
+                        for ns in task_names:
+                            proxy_source = proxy_name(source, ns)
+                            for name, branch in branches.items():
+                                if branch.ends is None:
+                                    new_branches[proxy_source][name] = branch
+                                    continue
+                                assert isinstance(branch.ends, dict)
+                                new_ends: dict[Hashable, str] = {}
+                                for k, v in branch.ends.items():
+                                    new_ends[k] = _rewrite_end_if_shared(
+                                        v, src_task_ns=ns
+                                    )
+                                new_branches[proxy_source][name] = BranchSpec(
+                                    path=branch.path,
+                                    ends=new_ends,
+                                    input_schema=branch.input_schema,
+                                )
+                    else:
+                        # START/END are special and don't exist in `orig_nodes`
+                        src_task_ns = None if source in (START, END) else orig_nodes[source].task_ns
+                        for name, branch in branches.items():
+                            if branch.ends is None:
+                                new_branches[source][name] = branch
+                                continue
+                            assert isinstance(branch.ends, dict)
+                            new_ends: dict[Hashable, str] = {}
+                            for k, v in branch.ends.items():
+                                if v in shared_nodes:
+                                    if src_task_ns is None:
+                                        raise ValueError(
+                                            f"Cannot rewrite branch end to shared node {v!r} "
+                                            f"from {source!r}: task_ns=None."
+                                        )
+                                    new_ends[k] = proxy_name(v, src_task_ns)
+                                else:
+                                    new_ends[k] = v
+                            new_branches[source][name] = BranchSpec(
+                                path=branch.path,
+                                ends=new_ends,
+                                input_schema=branch.input_schema,
+                            )
+
+                # 6) Apply node-set + edge/branch rewrites
+                self.nodes = new_nodes
+                self.edges = new_edges
+                self.waiting_edges = new_waiting_edges
+                self.branches = new_branches
+
+                # 7) Rewrite node-level `ends` if they reference shared nodes
+                for name, spec in list(self.nodes.items()):
+                    if name in (START, END) or not spec.ends:
+                        continue
+                    if spec.task_ns is None:
+                        raise ValueError(
+                            f"expand_shared_nodes requires all non-shared nodes "
+                            f"to have task_ns when their ends reference shared nodes. "
+                            f"Got task_ns=None for node {name!r}."
+                        )
+                    if isinstance(spec.ends, dict):
+                        ends: dict[Hashable, str] = {}
+                        for k, v in spec.ends.items():
+                            ends[k] = _rewrite_end_if_shared(
+                                v, src_task_ns=spec.task_ns
+                            )
+                        self.nodes[name] = StateNodeSpec(
+                            runnable=spec.runnable,
+                            metadata=spec.metadata,
+                            input_schema=spec.input_schema,
+                            retry_policy=spec.retry_policy,
+                            cache_policy=spec.cache_policy,
+                            ends=ends,
+                            defer=spec.defer,
+                            task_ns=spec.task_ns,
+                            shared=spec.shared,
+                        )
+                    else:
+                        ends_tuple: tuple[str, ...] = tuple(
+                            _rewrite_end_if_shared(
+                                v, src_task_ns=spec.task_ns
+                            )
+                            for v in spec.ends
+                        )
+                        self.nodes[name] = StateNodeSpec(
+                            runnable=spec.runnable,
+                            metadata=spec.metadata,
+                            input_schema=spec.input_schema,
+                            retry_policy=spec.retry_policy,
+                            cache_policy=spec.cache_policy,
+                            ends=ends_tuple,
+                            defer=spec.defer,
+                            task_ns=spec.task_ns,
+                            shared=spec.shared,
+                        )
 
         # assign default values
         interrupt_before = interrupt_before or []
@@ -1161,6 +1467,7 @@ class StateGraph(Generic[StateT, ContextT, InputT, OutputT]):
             name=name or "LangGraph",
         )
         compiled._serde_allowlist = serde_allowlist
+        compiled._auto_task_allowlist = auto_task_allowlist
 
         compiled.attach_node(START, None)
         for key, node in self.nodes.items():
@@ -1201,6 +1508,7 @@ class CompiledStateGraph(
     schema_to_mapper: dict[type[Any], Callable[[Any], Any] | None]
     _output_mapper: Callable[[Any], Any] | None
     _state_mapper: Callable[[Any], Any] | None
+    _auto_task_allowlist: bool = False
 
     def __init__(
         self,
@@ -1232,6 +1540,95 @@ class CompiledStateGraph(
             channels=self.builder.channels,
             name=self.get_name("Output"),
         )
+
+    def nodes_for_task_ns(self, task_ns: str) -> frozenset[str]:
+        """Names of nodes with the given compile-time ``task_ns`` (see :meth:`StateGraph.nodes_for_task_ns`)."""
+        return self.builder.nodes_for_task_ns(task_ns)
+
+    def _with_auto_task_allowlist(self, config: RunnableConfig | None) -> RunnableConfig:
+        """Set ``task_node_allowlist`` from :meth:`nodes_for_task_ns` when enabled at compile time."""
+        if not self._auto_task_allowlist:
+            return ensure_config(config)
+        cfg = ensure_config(config)
+        conf = cfg.get(CONF) or {}
+        if CONFIG_KEY_TASK_NODE_ALLOWLIST in conf:
+            return cfg
+        task_ns = conf.get(CONFIG_KEY_TASK_NS)
+        if task_ns is None:
+            return cfg
+        nodes = self.builder.nodes_for_task_ns(str(task_ns))
+        if not nodes:
+            return cfg
+        return patch_configurable(cfg, {CONFIG_KEY_TASK_NODE_ALLOWLIST: sorted(nodes)})
+
+    def stream(
+        self,
+        input: InputT | Command | None,
+        config: RunnableConfig | None = None,
+        *,
+        context: ContextT | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        output_keys: str | Sequence[str] | None = None,
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        subgraphs: bool = False,
+        debug: bool | None = None,
+        version: Literal["v1", "v2"] = "v1",
+        **kwargs: Any,
+    ) -> Iterator[Any]:
+        config = self._with_auto_task_allowlist(config)
+        yield from super().stream(
+            input,
+            config,
+            context=context,
+            stream_mode=stream_mode,
+            print_mode=print_mode,
+            output_keys=output_keys,
+            interrupt_before=interrupt_before,
+            interrupt_after=interrupt_after,
+            durability=durability,
+            subgraphs=subgraphs,
+            debug=debug,
+            version=version,
+            **kwargs,
+        )
+
+    async def astream(
+        self,
+        input: InputT | Command | None,
+        config: RunnableConfig | None = None,
+        *,
+        context: ContextT | None = None,
+        stream_mode: StreamMode | Sequence[StreamMode] | None = None,
+        print_mode: StreamMode | Sequence[StreamMode] = (),
+        output_keys: str | Sequence[str] | None = None,
+        interrupt_before: All | Sequence[str] | None = None,
+        interrupt_after: All | Sequence[str] | None = None,
+        durability: Durability | None = None,
+        subgraphs: bool = False,
+        debug: bool | None = None,
+        version: Literal["v1", "v2"] = "v1",
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        config = self._with_auto_task_allowlist(config)
+        async for chunk in super().astream(
+            input,
+            config,
+            context=context,
+            stream_mode=stream_mode,
+            print_mode=print_mode,
+            output_keys=output_keys,
+            interrupt_before=interrupt_before,
+            interrupt_after=interrupt_after,
+            durability=durability,
+            subgraphs=subgraphs,
+            debug=debug,
+            version=version,
+            **kwargs,
+        ):
+            yield chunk
 
     def attach_node(self, key: str, node: StateNodeSpec[Any, ContextT] | None) -> None:
         if key == START:

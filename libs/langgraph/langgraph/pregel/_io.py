@@ -4,6 +4,8 @@ from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, Literal
 
+from langchain_core.runnables import RunnableConfig
+
 from langgraph._internal._constants import (
     ERROR,
     INTERRUPT,
@@ -17,6 +19,7 @@ from langgraph.channels.base import BaseChannel, EmptyChannelError
 from langgraph.constants import START, TAG_HIDDEN
 from langgraph.errors import InvalidUpdateError
 from langgraph.pregel._log import logger
+from langgraph.pregel._task_policy import assert_task_routing_allowed
 from langgraph.types import Command, PregelExecutableTask, Send
 
 
@@ -53,7 +56,9 @@ def read_channels(
         return values
 
 
-def map_command(cmd: Command) -> Iterator[tuple[str, str, Any]]:
+def map_command(
+    cmd: Command, *, config: RunnableConfig | None = None
+) -> Iterator[tuple[str, str, Any]]:
     """Map input chunk to a sequence of pending writes in the form (channel, value)."""
     if cmd.graph == Command.PARENT:
         raise InvalidUpdateError("There is no parent graph")
@@ -64,8 +69,10 @@ def map_command(cmd: Command) -> Iterator[tuple[str, str, Any]]:
             sends = [cmd.goto]
         for send in sends:
             if isinstance(send, Send):
+                assert_task_routing_allowed(config, send.node)
                 yield (NULL_TASK_ID, TASKS, send)
             elif isinstance(send, str):
+                assert_task_routing_allowed(config, send)
                 yield (NULL_TASK_ID, f"branch:to:{send}", START)
             else:
                 raise TypeError(

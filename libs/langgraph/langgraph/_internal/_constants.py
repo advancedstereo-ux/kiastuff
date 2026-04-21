@@ -66,6 +66,34 @@ CONFIG_KEY_RUNTIME = sys.intern("__pregel_runtime")
 # holds a `Runtime` instance with context, store, stream writer, etc.
 CONFIG_KEY_RESUME_MAP = sys.intern("__pregel_resume_map")
 # holds a mapping of task ns -> resume value for resuming tasks
+CONFIG_KEY_TASK_NS = sys.intern("task_ns")
+# optional task identifier for logging / future policy (use with task_node_allowlist)
+CONFIG_KEY_TASK_NODE_ALLOWLIST = sys.intern("task_node_allowlist")
+# optional sequence of node names this task may route to and discover (listing mode)
+CONFIG_KEY_TASK_TOOL_ALLOWLIST = sys.intern("task_tool_allowlist")
+# optional sequence of tool names allowed for this run (ToolNode checks when set)
+
+CONFIG_KEY_ROUTE_GUARDS = sys.intern("route_guards")
+# optional mapping node_name -> sequence of state channel keys that must be truthy to route there
+
+CONFIG_KEY_ROUTE_STAMPS = sys.intern("route_stamps")
+# optional mapping node_name -> channel updates merged after that node succeeds (path stamps)
+
+CONFIG_KEY_ENFORCE_THREAD_TASK_NS = sys.intern("enforce_thread_task_ns")
+# if True, enforce a thread_id is only ever used with a single task_ns value
+
+THREAD_TASK_NS_BINDING = sys.intern("__langgraph_thread_task_ns_binding__")
+# checkpoint metadata key storing the first-bound task_ns for the given thread_id
+
+CONFIG_KEY_ENFORCE_THREAD_ID_FORMAT = sys.intern("enforce_thread_id_format")
+# if True, require thread_id format: tenant_id:user_id:session_id:run_id (only ":" splits;
+# tenant_id may embed org hierarchy with non-colon delimiters, e.g. acme.corp.region)
+
+CONFIG_KEY_ENFORCE_THREAD_ID_SCOPE = sys.intern("enforce_thread_id_scope")
+# if True, bind and enforce thread identity scope (tenant/user/session) in metadata
+
+THREAD_ID_SCOPE_BINDING = sys.intern("__langgraph_thread_id_scope_binding__")
+# checkpoint metadata key storing bound "tenant:user:session" identity scope
 
 # --- Other constants ---
 PUSH = sys.intern("__pregel_push")
@@ -107,6 +135,12 @@ RESERVED = {
     CONFIG_KEY_CHECKPOINT_ID,
     CONFIG_KEY_CHECKPOINT_NS,
     CONFIG_KEY_RESUME_MAP,
+    CONFIG_KEY_TASK_NS,
+    CONFIG_KEY_TASK_NODE_ALLOWLIST,
+    CONFIG_KEY_TASK_TOOL_ALLOWLIST,
+    CONFIG_KEY_ROUTE_GUARDS,
+    CONFIG_KEY_ROUTE_STAMPS,
+    CONFIG_KEY_ENFORCE_THREAD_TASK_NS,
     # other constants
     PUSH,
     PULL,

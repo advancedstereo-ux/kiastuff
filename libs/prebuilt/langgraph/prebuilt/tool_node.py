@@ -83,6 +83,7 @@ from langchain_core.tools.base import (
 )
 from langgraph._internal._runnable import RunnableCallable
 from langgraph.errors import GraphBubbleUp
+from langgraph.pregel._task_policy import get_task_tool_allowlist
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.store.base import BaseStore  # noqa: TC002
 from langgraph.types import Command, Send, StreamWriter
@@ -115,6 +116,24 @@ TOOL_INVOCATION_ERROR_TEMPLATE = (
     " {error}\n"
     " Please fix the error and try again."
 )
+
+
+def _task_tool_allowlist_block(
+    call: ToolCall, config: RunnableConfig
+) -> ToolMessage | None:
+    """Return a ToolMessage if ``task_tool_allowlist`` denies this tool, else None."""
+    allowlist = get_task_tool_allowlist(config)
+    if allowlist is None or call["name"] in allowlist:
+        return None
+    return ToolMessage(
+        content=(
+            f"Task policy denies execution of tool {call['name']!r} "
+            "(not in task_tool_allowlist)."
+        ),
+        name=call["name"],
+        tool_call_id=call["id"],
+        status="error",
+    )
 
 
 class _ToolCallRequestOverrides(TypedDict, total=False):
@@ -913,6 +932,9 @@ class ToolNode(RunnableCallable):
         call = request.tool_call
         tool = request.tool
 
+        if denied := _task_tool_allowlist_block(call, config):
+            return denied
+
         # Validate tool exists when we actually need to execute it
         if tool is None:
             if invalid_tool_message := self._validate_tool_call(call):
@@ -1065,6 +1087,9 @@ class ToolNode(RunnableCallable):
         """
         call = request.tool_call
         tool = request.tool
+
+        if denied := _task_tool_allowlist_block(call, config):
+            return denied
 
         # Validate tool exists when we actually need to execute it
         if tool is None:

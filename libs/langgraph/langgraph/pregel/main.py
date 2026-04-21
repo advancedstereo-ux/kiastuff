@@ -132,6 +132,7 @@ from langgraph.pregel._read import DEFAULT_BOUND, PregelNode
 from langgraph.pregel._retry import RetryPolicy
 from langgraph.pregel._runner import PregelRunner
 from langgraph.pregel._utils import get_new_channel_versions
+from langgraph.pregel._task_policy import task_node_visible_for_discovery
 from langgraph.pregel._validate import validate_graph, validate_keys
 from langgraph.pregel._write import ChannelWrite, ChannelWriteEntry
 from langgraph.pregel.debug import get_bolded_text, get_colored_text, tasks_w_writes
@@ -728,7 +729,9 @@ class Pregel(
                     config,
                     xray=xray if isinstance(xray, bool) or xray <= 0 else xray - 1,
                 )
-                for k, v in self.get_subgraphs()
+                for k, v in self.get_subgraphs(
+                    config=merge_configs(self.config, config)
+                )
             }
         else:
             subgraphs = {}
@@ -753,7 +756,10 @@ class Pregel(
         # gather subgraphs
         if xray:
             subpregels: dict[str, PregelProtocol] = {
-                k: v async for k, v in self.aget_subgraphs()
+                k: v
+                async for k, v in self.aget_subgraphs(
+                    config=merge_configs(self.config, config)
+                )
             }
             subgraphs = {
                 k: v
@@ -946,7 +952,11 @@ class Pregel(
         ]
 
     def get_subgraphs(
-        self, *, namespace: str | None = None, recurse: bool = False
+        self,
+        *,
+        namespace: str | None = None,
+        recurse: bool = False,
+        config: RunnableConfig | None = None,
     ) -> Iterator[tuple[str, PregelProtocol]]:
         """Get the subgraphs of the graph.
 
@@ -954,6 +964,10 @@ class Pregel(
             namespace: The namespace to filter the subgraphs by.
             recurse: Whether to recurse into the subgraphs.
                 If `False`, only the immediate subgraphs will be returned.
+            config: When ``config["configurable"]["task_node_allowlist"]`` is set,
+                listing mode (``namespace is None``) only returns subgraphs whose
+                node name is in the allowlist. Navigating by ``namespace`` is
+                unchanged.
 
         Returns:
             An iterator of the `(namespace, subgraph)` pairs.
@@ -963,6 +977,11 @@ class Pregel(
             if namespace is not None:
                 if not namespace.startswith(name):
                     continue
+
+            if not task_node_visible_for_discovery(
+                name, config, list_mode=namespace is None
+            ):
+                continue
 
             # find the subgraph, if any
             graph = node.subgraphs[0] if node.subgraphs else None
@@ -980,12 +999,16 @@ class Pregel(
                     yield from (
                         (f"{name}{NS_SEP}{n}", s)
                         for n, s in graph.get_subgraphs(
-                            namespace=namespace, recurse=recurse
+                            namespace=namespace, recurse=recurse, config=config
                         )
                     )
 
     async def aget_subgraphs(
-        self, *, namespace: str | None = None, recurse: bool = False
+        self,
+        *,
+        namespace: str | None = None,
+        recurse: bool = False,
+        config: RunnableConfig | None = None,
     ) -> AsyncIterator[tuple[str, PregelProtocol]]:
         """Get the subgraphs of the graph.
 
@@ -993,11 +1016,14 @@ class Pregel(
             namespace: The namespace to filter the subgraphs by.
             recurse: Whether to recurse into the subgraphs.
                 If `False`, only the immediate subgraphs will be returned.
+            config: Same as :meth:`get_subgraphs`.
 
         Returns:
             An iterator of the `(namespace, subgraph)` pairs.
         """
-        for name, node in self.get_subgraphs(namespace=namespace, recurse=recurse):
+        for name, node in self.get_subgraphs(
+            namespace=namespace, recurse=recurse, config=config
+        ):
             yield name, node
 
     # Mappers for v2 stream coercion (pydantic/dataclass).
@@ -1061,7 +1087,7 @@ class Pregel(
             ),
             manager=None,
         )
-        # get the subgraphs
+        # get the subgraphs (no task_node_allowlist: must include every task node)
         subgraphs = dict(self.get_subgraphs())
         parent_ns = saved.config[CONF].get(CONFIG_KEY_CHECKPOINT_NS, "")
         task_states: dict[str, RunnableConfig | StateSnapshot] = {}
@@ -1181,6 +1207,7 @@ class Pregel(
             manager=None,
         )
         # get the subgraphs
+        # no task_node_allowlist: must include every task node
         subgraphs = {n: g async for n, g in self.aget_subgraphs()}
         parent_ns = saved.config[CONF].get(CONFIG_KEY_CHECKPOINT_NS, "")
         task_states: dict[str, RunnableConfig | StateSnapshot] = {}
